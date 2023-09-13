@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"mvdan.cc/fdroidcl/adb"
 	"mvdan.cc/fdroidcl/fdroid"
@@ -26,8 +28,15 @@ list of apps to install from standard input, like:
 }
 
 var (
-	installUpdates = cmdInstall.Fset.Bool("u", false, "Upgrade all installed apps")
-	installDryRun  = cmdInstall.Fset.Bool("n", false, "Only print the operations that would be done")
+	installUpdates        = cmdInstall.Fset.Bool("u", false, "Upgrade all installed apps")
+	installDryRun         = cmdInstall.Fset.Bool("n", false, "Only print the operations that would be done")
+	installUpdatesExclude = cmdInstall.Fset.String("e", "", "Exclude apps from upgrading (comma-separated list)")
+	installSkipError      = cmdInstall.Fset.Bool("s", false, "Skip to the next application if a download or install error occurs")
+	installUser           = cmdInstall.Fset.String("user", "", `Install/upgrade for specified user <USER_ID|current|all>
+	default: installs app for the current user; upgrades apps of all users and installs the new version only for the users of the old version
+	USER_ID: installs app for USER_ID; upgrades only apps of USER_ID and installs the new version only for USER_ID
+	current: installs app for the current user; upgrades only apps of the current user and installs the new version only for the current user
+	all: installs app for all users; upgrades apps of all users and installs the new version for all users`)
 )
 
 func init() {
@@ -38,6 +47,9 @@ func runInstall(args []string) error {
 	if *installUpdates && len(args) > 0 {
 		return fmt.Errorf("-u can only be used without arguments")
 	}
+	if *installUpdatesExclude != "" && !*installUpdates {
+		return fmt.Errorf("-e can only be used for upgrading (i.e. -u)")
+	}
 	device, err := oneDevice()
 	if err != nil {
 		return err
@@ -46,17 +58,65 @@ func runInstall(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *installUser != "" && *installUser != "all" && *installUser != "current" {
+		n, err := strconv.Atoi(*installUser)
+		if err != nil {
+			return fmt.Errorf("-user has to be <USER_ID|current|all>")
+		}
+		if n < 0 {
+			return fmt.Errorf("-user cannot have a negative number as USER_ID")
+		}
+		allUids := adb.AllUserIds(inst)
+		if _, exists := allUids[n]; !exists {
+			return fmt.Errorf("user %d does not exist", n)
+		}
+	}
+	if *installUser == "current" || (*installUser == "" && !*installUpdates) {
+		uid, err := device.CurrentUserId()
+		if err != nil {
+			return err
+		}
+		*installUser = strconv.Itoa(uid)
+	}
 
 	if *installUpdates {
 		apps, err := loadIndexes()
 		if err != nil {
 			return err
 		}
-		apps = filterAppsUpdates(apps, inst, device)
+		var filterUser *int
+		if *installUser == "all" || *installUser == "" {
+			filterUser = nil
+		} else {
+			n, err := strconv.Atoi(*installUser)
+			if err != nil {
+				return err
+			}
+			filterUser = &n
+		}
+		apps = filterAppsUpdates(apps, inst, device, filterUser)
+		if *installUpdatesExclude != "" {
+			excludeApps := strings.Split(*installUpdatesExclude, ",")
+			installApps := make([]fdroid.App, 0)
+			for _, app := range apps {
+				shouldExclude := false
+				for _, exclude := range excludeApps {
+					if app.PackageName == exclude {
+						shouldExclude = true
+						break
+					}
+				}
+				if shouldExclude {
+					continue
+				}
+				installApps = append(installApps, app)
+			}
+			apps = installApps
+		}
 		if len(apps) == 0 {
 			fmt.Fprintln(os.Stderr, "All apps up to date.")
 		}
-		return downloadAndDo(apps, device)
+		return downloadAndDo(apps, inst, device)
 	}
 
 	if len(args) == 0 {
@@ -99,23 +159,45 @@ func runInstall(args []string) error {
 			return fmt.Errorf("no suitable APKs found for %s", app.PackageName)
 		}
 		if p.VersCode >= suggested.VersCode {
-			fmt.Printf("%s is up to date\n", app.PackageName)
-			// app is already up to date
-			continue
+			if !(*installUser == "all" && len(p.NotInstalledForUsers) > 0) { // ensure that it can't install for other user
+				okSkip := *installUser == "all"
+				if !okSkip {
+					n, err := strconv.Atoi(*installUser)
+					if err != nil {
+						return err
+					}
+					isInstalledForUser := false
+					for _, uid := range p.InstalledForUsers {
+						if uid == n {
+							isInstalledForUser = true
+							break
+						}
+					}
+					if isInstalledForUser {
+						okSkip = true
+					}
+				}
+				if okSkip {
+					fmt.Printf("%s is up to date\n", app.PackageName)
+					// app is already up to date
+					continue
+				}
+			}
 		}
 		// upgrading an existing app
 		toInstall = append(toInstall, app)
 	}
-	return downloadAndDo(toInstall, device)
+	return downloadAndDo(toInstall, inst, device)
 }
 
-func downloadAndDo(apps []fdroid.App, device *adb.Device) error {
+func downloadAndDo(apps []fdroid.App, installed map[string]adb.Package, device *adb.Device) error {
 	type downloaded struct {
 		apk  *fdroid.Apk
+		app  fdroid.App
 		path string
 	}
-	toInstall := make([]downloaded, len(apps))
-	for i, app := range apps {
+	toInstall := make([]downloaded, 0)
+	for _, app := range apps {
 		apk := app.SuggestedApk(device)
 		if apk == nil {
 			return fmt.Errorf("no suitable APKs found for %s", app.PackageName)
@@ -126,25 +208,56 @@ func downloadAndDo(apps []fdroid.App, device *adb.Device) error {
 		}
 		path, err := downloadApk(apk)
 		if err != nil {
+			if *installSkipError {
+				fmt.Printf("Downloading %s failed, skipping...\n", app.PackageName)
+				continue
+			}
 			return err
 		}
-		toInstall[i] = downloaded{apk: apk, path: path}
+		toInstall = append(toInstall, downloaded{apk: apk, app: app, path: path})
 	}
 	if *installDryRun {
 		return nil
 	}
 	for _, t := range toInstall {
-		if err := installApk(device, t.apk, t.path); err != nil {
+		var installedPkg *adb.Package = nil
+		if p, e := installed[t.app.PackageName]; e {
+			installedPkg = &p
+		}
+		if err := installApk(device, t.apk, installedPkg, t.path); err != nil {
+			if *installSkipError {
+				fmt.Printf("Installing %s failed, skipping...\n", t.apk.AppID)
+				continue
+			}
 			return err
 		}
 	}
 	return nil
 }
 
-func installApk(device *adb.Device, apk *fdroid.Apk, path string) error {
+func installApk(device *adb.Device, apk *fdroid.Apk, devicePkg *adb.Package, path string) error {
 	fmt.Printf("Installing %s\n", apk.AppID)
-	if err := device.Install(path); err != nil {
-		return fmt.Errorf("could not install %s: %v", apk.AppID, err)
+	userId := "all"
+	if *installUser != "all" {
+		if *installUpdates && *installUser == "" {
+			if devicePkg == nil {
+				return fmt.Errorf("failed to get device package although it should be installed (please report this error)")
+			}
+			if len((*devicePkg).InstalledForUsers) > 0 {
+				userId = strconv.Itoa((*devicePkg).InstalledForUsers[0])
+			}
+		} else {
+			userId = *installUser
+		}
+	}
+	if userId == "all" {
+		if err := device.Install(path); err != nil {
+			return fmt.Errorf("could not install %s: %v", apk.AppID, err)
+		}
+	} else {
+		if err := device.InstallUser(path, userId); err != nil {
+			return fmt.Errorf("could not install %s: %v", apk.AppID, err)
+		}
 	}
 	return nil
 }

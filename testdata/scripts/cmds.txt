@@ -11,7 +11,7 @@ stderr '^usage: fdroidcl \[-h'
 # ! stdout .
 
 fdroidcl version
-stdout '^v0\.5'
+stdout '^v0\.7'
 
 ! fdroidcl -badflag -- somepkg
 stderr '-badflag'
@@ -29,3 +29,24 @@ stderr 'When given no arguments'
 
 ! fdroidcl install -u some.app
 stderr 'without arguments'
+
+! fdroidcl install -e com.fsck.k9,org.videolan.vlc
+stderr '-e can only be used for upgrading'
+
+! fdroidcl clean a b
+stderr 'wrong amount of arguments'
+
+! fdroidcl clean a
+stderr 'pass either index or cache as parameter, or no parameter at all'
+
+fdroidcl clean index
+stdout 'Cleaned index\.'
+! stderr .
+
+fdroidcl clean cache
+stdout 'Cleaned cache\.'
+! stderr .
+
+fdroidcl clean
+stdout 'Cleaned index and cache\.'
+! stderr .

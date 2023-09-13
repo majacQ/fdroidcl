@@ -65,12 +65,13 @@ func Devices() ([]*Device, error) {
 		if err != nil {
 			return nil, err
 		}
-		device.ABIs = getAbis(props)
+		device.ABIs = getAbis(device, props)
 		if len(device.ABIs) == 0 {
 			return nil, fmt.Errorf("failed to get device ABIs")
 		}
-		device.APILevel, _ = strconv.Atoi(props["ro.build.version.sdk"])
-		if device.APILevel == 0 {
+		api, err := AdbPropFallback(device, props, "ro.build.version.sdk")
+		device.APILevel, _ = strconv.Atoi(api)
+		if err != nil || device.APILevel == 0 {
 			return nil, fmt.Errorf("failed to get device API level")
 		}
 
@@ -113,22 +114,49 @@ func (d *Device) AdbProps() (map[string]string, error) {
 	return props, nil
 }
 
+func (d *Device) AdbProp(property string) (string, error) {
+	cmd := d.AdbShell("getprop", property)
+	stdout, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	result := string(stdout)
+	if strings.HasSuffix(result, "\r\n") {
+		result = strings.TrimSuffix(result, "\r\n")
+	} else if strings.HasSuffix(result, "\n") {
+		result = strings.TrimSuffix(result, "\n")
+	} else if strings.HasSuffix(result, "\r") {
+		result = strings.TrimSuffix(result, "\r")
+	}
+	if result == "" {
+		return "", fmt.Errorf("could not get property %s", property)
+	}
+	return result, nil
+}
+
+func AdbPropFallback(device *Device, props map[string]string, property string) (string, error) {
+	if value, e := props[property]; e {
+		return value, nil
+	}
+	return device.AdbProp(property)
+}
+
 func getFailureCode(r *regexp.Regexp, line string) string {
 	return r.FindStringSubmatch(line)[1]
 }
 
-func getAbis(props map[string]string) []string {
+func getAbis(device *Device, props map[string]string) []string {
 	// Android 5.0 and later specify a list of ABIs
-	if abilist, e := props["ro.product.cpu.abilist"]; e {
+	if abilist, err := AdbPropFallback(device, props, "ro.product.cpu.abilist"); err == nil {
 		return strings.Split(abilist, ",")
 	}
 	// Older Android versions specify one primary ABI and optionally
 	// one secondary ABI
-	abi, e := props["ro.product.cpu.abi"]
-	if !e {
+	abi, err := AdbPropFallback(device, props, "ro.product.cpu.abi")
+	if err != nil {
 		return nil
 	}
-	if abi2, e := props["ro.product.cpu.abi2"]; e {
+	if abi2, err := AdbPropFallback(device, props, "ro.product.cpu.abi2"); err == nil {
 		return []string{abi, abi2}
 	}
 	return []string{abi}
@@ -139,14 +167,29 @@ var installFailureRegex = regexp.MustCompile(`^Failure \[INSTALL_(.+)\]$`)
 func (d *Device) Install(path string) error {
 	cmd := d.AdbCmd(append([]string{"install", "-r"}, path)...)
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return err
-	}
 	line := getResultLine(output)
-	if line == "Success" {
+	if err == nil && line == "Success" {
 		return nil
 	}
-	return parseError(getFailureCode(installFailureRegex, line))
+	errMsg := parseError(getFailureCode(installFailureRegex, line))
+	if err != nil {
+		return fmt.Errorf("%v: %v", err, errMsg)
+	}
+	return errMsg
+}
+
+func (d *Device) InstallUser(path, user string) error {
+	cmd := d.AdbCmd(append([]string{"install", "-r", "--user"}, user, path)...)
+	output, err := cmd.CombinedOutput()
+	line := getResultLine(output)
+	if err == nil && line == "Success" {
+		return nil
+	}
+	errMsg := parseError(getFailureCode(installFailureRegex, line))
+	if err != nil {
+		return fmt.Errorf("%v: %v", err, errMsg)
+	}
+	return errMsg
 }
 
 func getResultLine(output []byte) string {
@@ -169,26 +212,47 @@ var deleteFailureRegex = regexp.MustCompile(`^Failure \[DELETE_(.+)\]$`)
 func (d *Device) Uninstall(pkg string) error {
 	cmd := d.AdbCmd("uninstall", pkg)
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return err
-	}
 	line := getResultLine(output)
-	if line == "Success" {
+	if err == nil && line == "Success" {
 		return nil
 	}
-	return parseError(getFailureCode(deleteFailureRegex, line))
+	errMsg := parseError(getFailureCode(deleteFailureRegex, line))
+	if err != nil {
+		return fmt.Errorf("%v: %v", err, errMsg)
+	}
+	return errMsg
+}
+
+func (d *Device) UninstallUser(pkg, user string) error {
+	cmd := d.AdbCmd("uninstall", "--user", user, pkg)
+	output, err := cmd.CombinedOutput()
+	line := getResultLine(output)
+	if err == nil && line == "Success" {
+		return nil
+	}
+	errMsg := parseError(getFailureCode(deleteFailureRegex, line))
+	if err != nil {
+		return fmt.Errorf("%v: %v", err, errMsg)
+	}
+	return errMsg
 }
 
 type Package struct {
-	ID       string
-	VersCode int
-	VersName string
+	ID                   string
+	VersCode             int
+	VersName             string
+	IsSystem             bool
+	InstalledForUsers    []int
+	NotInstalledForUsers []int
 }
 
 var (
-	packageRegex = regexp.MustCompile(`^  Package \[([^\s]+)\]`)
-	verCodeRegex = regexp.MustCompile(`^    versionCode=([0-9]+)`)
-	verNameRegex = regexp.MustCompile(`^    versionName=(.+)`)
+	packageRegex           = regexp.MustCompile(`^  Package \[([^\s]+)\]`)
+	verCodeRegex           = regexp.MustCompile(`^    versionCode=([0-9]+)`)
+	verNameRegex           = regexp.MustCompile(`^    versionName=(.+)`)
+	systemRegex            = regexp.MustCompile(`^    pkgFlags=\[.*\bSYSTEM\b.*\]`)
+	installedUsersRegex    = regexp.MustCompile(`^    User (\d+): .*installed=true`)
+	notInstalledUsersRegex = regexp.MustCompile(`^    User (\d+): .*installed=false`)
 )
 
 func (d *Device) Installed() (map[string]Package, error) {
@@ -212,6 +276,9 @@ func (d *Device) Installed() (map[string]Package, error) {
 			} else {
 				packages[cur.ID] = cur
 				cur = Package{}
+				cur.IsSystem = false
+				cur.InstalledForUsers = make([]int, 0)
+				cur.NotInstalledForUsers = make([]int, 0)
 			}
 			cur.ID = m[1]
 		} else if m := verCodeRegex.FindStringSubmatch(l); m != nil {
@@ -222,10 +289,60 @@ func (d *Device) Installed() (map[string]Package, error) {
 			cur.VersCode = n
 		} else if m := verNameRegex.FindStringSubmatch(l); m != nil {
 			cur.VersName = m[1]
+		} else if systemRegex.MatchString(l) {
+			cur.IsSystem = true
+		} else if m := installedUsersRegex.FindStringSubmatch(l); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err != nil {
+				panic(err)
+			}
+			cur.InstalledForUsers = append(cur.InstalledForUsers, n)
+		} else if m := notInstalledUsersRegex.FindStringSubmatch(l); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err != nil {
+				panic(err)
+			}
+			cur.NotInstalledForUsers = append(cur.NotInstalledForUsers, n)
 		}
 	}
 	if !first {
 		packages[cur.ID] = cur
 	}
 	return packages, nil
+}
+
+var currentUserIdRegex = regexp.MustCompile(`^ *mUserLru: \[.*\b(\d+)\b\]`)
+
+func (d *Device) CurrentUserId() (int, error) {
+	cmd := d.AdbShell("dumpsys", "activity")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return -1, err
+	}
+	if err := cmd.Start(); err != nil {
+		return -1, err
+	}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		m := currentUserIdRegex.FindStringSubmatch(scanner.Text())
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			panic(err)
+		}
+		return n, nil
+	}
+	return -1, fmt.Errorf("could not get current user id")
+}
+
+func AllUserIds(installed map[string]Package) map[int]struct{} {
+	uidMap := make(map[int]struct{})
+	for _, pkg := range installed {
+		for _, uid := range pkg.InstalledForUsers {
+			uidMap[uid] = struct{}{}
+		}
+	}
+	return uidMap
 }

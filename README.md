@@ -2,9 +2,9 @@
 
 [![GoDoc](https://godoc.org/github.com/mvdan/fdroidcl?status.svg)](https://godoc.org/mvdan.cc/fdroidcl)
 
-[F-Droid](https://f-droid.org/) desktop client. Requires Go 1.14 or later.
+[F-Droid](https://f-droid.org/) desktop client. Requires Go 1.19 or later.
 
-	go get mvdan.cc/fdroidcl
+	go install mvdan.cc/fdroidcl@latest
 
 While the Android client integrates with the system with regular update checks
 and notifications, this is a simple command line client that talks to connected
@@ -33,16 +33,18 @@ Unofficial packages are available on: [Debian](https://packages.debian.org/buste
 
 ### Commands
 
-	update                Update the index
-	search [<regexp...>]  Search available apps
-	show <appid...>       Show detailed info about an app
-	install [<appid...>]  Install or upgrade apps
-	uninstall <appid...>  Uninstall an app
-	download <appid...>   Download an app
-	devices               List connected devices
-	list (categories)     List all known values of a kind
-	defaults              Reset to the default settings
-	version               Print version information
+	update                   Update the index
+	search [<regexp...>]     Search available apps
+	show <appid...>          Show detailed info about apps
+	install [<appid...>]     Install or upgrade apps
+	uninstall <appid...>     Uninstall an app
+	download <appid...>      Download an app
+	devices                  List connected devices
+	list (categories/users)  List all known values of a kind
+	repo                     Manage repositories
+	clean                    Clean index and/or cache
+	defaults                 Reset to the default settings
+	version                  Print version information
 
 
 An appid is just an app's unique package name. A specific version of an app can
@@ -59,6 +61,26 @@ You can configure what repositories to use in the `config.json` file. On Linux,
 you will likely find it at `~/.config/fdroidcl/config.json`.
 
 You can run `fdroidcl defaults` to create the config with the default settings.
+
+#### *new: you can manage the repositories now directly via cli*
+
+```
+usage: fdroidcl repo
+
+List, add, remove, enable or disable repositories.
+When a repository is added, it is enabled by default.
+
+List repositories:
+
+        $ fdroidcl repo
+
+Modify repositories:
+
+        $ fdroidcl repo add <NAME> <URL>
+        $ fdroidcl repo remove <NAME>
+        $ fdroidcl repo enable <NAME>
+        $ fdroidcl repo disable <NAME>
+```
 
 ### Advantages over the Android client
 
